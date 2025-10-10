@@ -44,6 +44,37 @@ class URDFKinematicsSolver:
             print(f"Loaded URDF with {len(self.joints)} joints.")
             print(f"End-effector link: {self.end_effector_link}")
 
+    # Returns one ndarray of shape (4,4) - a transfromation matrix that
+    # encodes the position and rotation of the end effector
+    def forward_kinematics(self, joint_angles: List[float]) -> np.ndarray:
+        """
+        Compute the forward kinematics to get the end-effector pose.
+        joint_angles: List of joint angles in radians.
+        Returns a 4x4 transformation matrix representing the end-effector pose.
+        """
+        joint_dict = {name: angle for name, angle in zip(self.joint_names, joint_angles)}
+        fk = self.robot.link_fk(joint_dict)
+        return fk[self.end_effector_link]
+    
+    def compute_jacobian(self, joint_angles: List[float]) -> np.ndarray:
+        """
+        Compute the Jacobian matrix at the current joint angles.
+        joint_angles: List of joint angles in radians.
+        Returns a 6xN Jacobian matrix, where N is the number of joints.
+        """
+        joint_dict = {name: angle for name, angle in zip(self.joint_names, joint_angles)}
+        J = self.robot.jacobian(joint_dict, self.end_effector_link)
+        return J
+    
+    def get_pose_from_transform(self, T: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Extract position and orientation (as quaternion) from a 4x4 transformation matrix.
+        Returns: (position (3,), orientation_quat (4,))
+        """
+        position = T[:3, 3]
+        rotation_matrix = T[:3, :3]
+        orientation_quat = R.from_matrix(rotation_matrix).as_quat()
+        return position, orientation_quat
 
 def plan_trajectory(current_joints: dict[str, float],
                     desired_eef_pose: tuple[float, float, float, float, float, float]
