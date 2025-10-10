@@ -1,5 +1,7 @@
+import os
 import numpy as np
 import pybullet as p
+import pybullet_data
 from scipy.spatial.transform import Rotation as R
 from typing import List, Dict, Tuple
 
@@ -11,13 +13,18 @@ class URDFKinematicsSolver:
     Uses Numpy and SciPy for numerical computations. 
     """
 
-    def __init__(self, urdf_path: str):
+    def __init__(self, urdf_path: str = None):
         # Initialize PyBullet in DIRECT mode (no GUI)
         self.physics_client = p.connect(p.DIRECT)
-        p.setAdditionalSearchPath(os.path.dirname(urdf_path))
         
-        # Load URDF
-        self.robot_id = p.loadURDF(urdf_path, useFixedBase=True)
+        # Use PyBullet's built-in xarm6 if no path specified
+        if urdf_path is None or "xarm6" in urdf_path:
+            import pybullet_data
+            p.setAdditionalSearchPath(pybullet_data.getDataPath())
+            self.robot_id = p.loadURDF("xarm/xarm6_robot.urdf", useFixedBase=True)
+        else:
+            p.setAdditionalSearchPath(os.path.dirname(urdf_path))
+            self.robot_id = p.loadURDF(urdf_path, useFixedBase=True)
         
         # Extract joint information
         num_joints = p.getNumJoints(self.robot_id)
@@ -38,29 +45,56 @@ class URDFKinematicsSolver:
         # Find end-effector link (last link)
         self.end_effector_index = num_joints - 1
 
-        print(f"Loaded URDF with {len(self.joints)} joints.")
-        print(f"End-effector link: {self.end_effector_link}")
+        print(f"Loaded URDF with {len(self.joint_names)} joints: {self.joint_names}")
 
-    # Returns one ndarray of shape (4,4) - a transfromation matrix that
-    # encodes the position and rotation of the end effector
     def forward_kinematics(self, joint_angles: List[float]) -> np.ndarray:
         """
         Compute the forward kinematics to get the end-effector pose.
         joint_angles: List of joint angles in radians.
         Returns a 4x4 transformation matrix representing the end-effector pose.
         """
-        joint_dict = {name: angle for name, angle in zip(self.joint_names, joint_angles)}
-        fk = self.robot.link_fk(joint_dict)
-        return fk[self.end_effector_link]
+        # Set joint positions
+        for i, joint_idx in enumerate(self.joint_indices):
+            if i < len(joint_angles):
+                p.resetJointState(self.robot_id, joint_idx, joint_angles[i])
+        
+        # Get end-effector pose
+        link_state = p.getLinkState(self.robot_id, self.end_effector_index)
+        pos = link_state[0]  # position
+        orn = link_state[1]  # orientation (quaternion)
+        
+        # Convert to 4x4 transformation matrix
+        T = np.eye(4)
+        T[:3, 3] = pos
+        T[:3, :3] = R.from_quat(orn).as_matrix()
+        return T
     
     def compute_jacobian(self, joint_angles: List[float]) -> np.ndarray:
         """
-        Compute the Jacobian matrix at the current joint angles.
+        Compute the Jacobian matrix at the current joint angles using numerical differentiation.
         joint_angles: List of joint angles in radians.
         Returns a 6xN Jacobian matrix, where N is the number of joints.
         """
-        joint_dict = {name: angle for name, angle in zip(self.joint_names, joint_angles)}
-        J = self.robot.jacobian(joint_dict, self.end_effector_link)
+        eps = 1e-6
+        J = np.zeros((6, len(joint_angles)))
+        T0 = self.forward_kinematics(joint_angles)
+        pos0, quat0 = self.get_pose_from_transform(T0)
+        R0 = R.from_quat(quat0).as_matrix()
+        
+        for i in range(len(joint_angles)):
+            q_pert = joint_angles.copy()
+            q_pert[i] += eps
+            T_pert = self.forward_kinematics(q_pert)
+            pos_pert, quat_pert = self.get_pose_from_transform(T_pert)
+            R_pert = R.from_quat(quat_pert).as_matrix()
+            
+            # Linear velocity
+            J[:3, i] = (pos_pert - pos0) / eps
+            
+            # Angular velocity (using rotation matrix difference)
+            omega_skew = (R_pert - R0) @ R0.T / eps
+            J[3:, i] = [omega_skew[2,1], omega_skew[0,2], omega_skew[1,0]]
+        
         return J
     
     def get_pose_from_transform(self, T: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -82,20 +116,14 @@ class URDFKinematicsSolver:
                 if not (lower <= angle <= upper):
                     return False
         
-        # Simple self-collision check (distance-based)
-        try:
-            joint_cfg = {name: q[i] if i < len(q) else 0.0 
-                        for i, name in enumerate(self.joint_names)}
-            fk = self.robot.link_fk(cfg=joint_cfg)
-            positions = [T[:3, 3] for T in fk.values()]
-            
-            for i in range(len(positions)):
-                for j in range(i + 2, len(positions)):
-                    if np.linalg.norm(positions[i] - positions[j]) < 0.1:
-                        return True  # Collision
-            return False
-        except:
-            return False
+        # Set joint positions for collision check
+        for i, joint_idx in enumerate(self.joint_indices):
+            if i < len(q):
+                p.resetJointState(self.robot_id, joint_idx, q[i])
+        
+        # Simple collision check using PyBullet
+        contacts = p.getContactPoints(self.robot_id, self.robot_id)
+        return len(contacts) == 0  # No self-collision
     
     def inverse_kinematics(self, target_transform: np.ndarray, 
                           max_iter: int = 100) -> Tuple[List[float], bool]:
@@ -115,7 +143,7 @@ class URDFKinematicsSolver:
             
             for _ in range(max_iter):
                 T = self.forward_kinematics(q)
-                pos, quat = self.get_pose(T)
+                pos, quat = self.get_pose_from_transform(T)
                 
                 # Position error (same as before)
                 pos_err = target_pos - pos
@@ -152,7 +180,13 @@ class URDFKinematicsSolver:
             if self.is_valid(q):
                 path.append(q)
         return path if path else [q_start, q_end]
-
+    
+    def __del__(self):
+        """Clean up PyBullet connection"""
+        try:
+            p.disconnect(self.physics_client)
+        except:
+            pass
 
 def plan_trajectory(current_joints: dict[str, float],
                     desired_eef_pose: tuple[float, float, float, float, float, float]
@@ -167,7 +201,7 @@ def plan_trajectory(current_joints: dict[str, float],
         forming a smooth path from the current configuration to one that
         achieves the desired end-effector pose.
     """
-    solver = URDFKinematicsSolver("xarm6.urdf")
+    solver = URDFKinematicsSolver()  # Use built-in xarm6
     
     # Joint name mapping
     mapping = {"base": "joint1", "shoulder": "joint2", "elbow": "joint3", 
@@ -218,9 +252,7 @@ def main():
     print(f"Current: {current_joints}")
     print(f"Target:  {desired_pose}")
     
-    # Plan and time-parameterize trajectory
-    waypoints = plan_trajectory(current_joints, desired_pose)
-
+    # Plan trajectory
     waypoints = plan_trajectory(current_joints, desired_pose)
     print(f"Generated {len(waypoints)} waypoints")
 
