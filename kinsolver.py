@@ -220,6 +220,8 @@ def plan_trajectory(current_joints: dict[str, float],
     
     # Solve inverse kinematics (handles multiple initial guesses internally)
     target_q, success = solver.inverse_kinematics(target_transform)
+    if not success:
+        raise ValueError("Inverse kinematics failed to find a valid solution.")
     
     # Generate path and convert back to dict format
     path = solver.interpolate_path(current_q, target_q)
