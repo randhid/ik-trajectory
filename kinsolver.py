@@ -100,6 +100,62 @@ class URDFKinematicsSolver:
         except:
             return False
     
+    def inverse_kinematics(self, target_transform: np.ndarray, 
+                          max_iter: int = 100) -> Tuple[List[float], bool]:
+        """Solve IK using pseudo-inverse Jacobian method with quaternion-based orientation error"""
+        target_pos = target_transform[:3, 3]
+        target_quat = R.from_matrix(target_transform[:3, :3]).as_quat()
+        
+        # Try multiple initial guesses
+        initial_guesses = [
+            [0.0] * len(self.joint_names),  # Home position
+            np.random.uniform(-1, 1, len(self.joint_names)),  # Random
+            [(l + u) / 2 for l, u in self.joint_limits],  # Mid-range
+        ]
+        
+        for initial_guess in initial_guesses:
+            q = np.array(initial_guess)
+            
+            for _ in range(max_iter):
+                T = self.forward_kinematics(q)
+                pos, quat = self.get_pose(T)
+                
+                # Position error (same as before)
+                pos_err = target_pos - pos
+                
+                # Quaternion-based orientation error using scipy
+                # Compute rotation difference and convert to axis-angle
+                R_target = R.from_quat(target_quat)
+                R_current = R.from_quat(quat)
+                R_error = R_target * R_current.inv()
+                quat_err = R_error.as_rotvec()
+                
+                # Combined error
+                error = np.concatenate([pos_err, 0.5 * quat_err])
+                
+                if np.linalg.norm(error) < 1e-4 and self.is_valid(q):
+                    return q.tolist(), True
+                
+                J = self.compute_jacobian(q)
+                J[3:] *= 0.5  # Weight orientation
+                J_pinv = J.T @ np.linalg.inv(J @ J.T + 0.01 * np.eye(6))
+                
+                q += 0.1 * J_pinv @ error
+                q = np.clip(q, [l for l, u in self.joint_limits], [u for l, u in self.joint_limits])
+        
+        # If no initial guess worked, return the last attempt
+        return q.tolist(), False
+    
+    def interpolate_path(self, q_start: List[float], q_end: List[float], n: int = 20) -> List[List[float]]:
+        """Linear interpolation with collision checking"""
+        path = []
+        for i in range(n + 1):
+            alpha = i / n
+            q = [(1-alpha)*s + alpha*e for s, e in zip(q_start, q_end)]
+            if self.is_valid(q):
+                path.append(q)
+        return path if path else [q_start, q_end]
+
 
 def plan_trajectory(current_joints: dict[str, float],
                     desired_eef_pose: tuple[float, float, float, float, float, float]
