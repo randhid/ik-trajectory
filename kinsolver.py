@@ -1,8 +1,7 @@
 import numpy as np
+import pybullet as p
 from scipy.spatial.transform import Rotation as R
-from scipy.optimize import minimize
 from typing import List, Dict, Tuple
-import urdfpy
 
 
 class URDFKinematicsSolver:
@@ -13,36 +12,34 @@ class URDFKinematicsSolver:
     """
 
     def __init__(self, urdf_path: str):
-        self.urdf_path = urdf_path
-        self.robot = urdfpy.URDF.load(urdf_path)
-
-        ## Extract joint infromation from URDF
-        self.joints = []
+        # Initialize PyBullet in DIRECT mode (no GUI)
+        self.physics_client = p.connect(p.DIRECT)
+        p.setAdditionalSearchPath(os.path.dirname(urdf_path))
+        
+        # Load URDF
+        self.robot_id = p.loadURDF(urdf_path, useFixedBase=True)
+        
+        # Extract joint information
+        num_joints = p.getNumJoints(self.robot_id)
         self.joint_names = []
-        self.joint_limits = {}
+        self.joint_limits = []
+        self.joint_indices = []
+        
+        for i in range(num_joints):
+            joint_info = p.getJointInfo(self.robot_id, i)
+            joint_type = joint_info[2]
+            if joint_type in [p.JOINT_REVOLUTE, p.JOINT_PRISMATIC]:
+                self.joint_names.append(joint_info[1].decode('utf-8'))
+                self.joint_indices.append(i)
+                lower_limit = joint_info[8] if joint_info[8] != -float('inf') else -np.pi
+                upper_limit = joint_info[9] if joint_info[9] != float('inf') else np.pi
+                self.joint_limits.append((lower_limit, upper_limit))
+        
+        # Find end-effector link (last link)
+        self.end_effector_index = num_joints - 1
 
-        for joint in self.robot.joints:
-            # We are only considering serial chains with joints that rotate or are linear
-            # As opposed to something like a hexbot which has spherical joints (3R in one joint)
-            if joint.joint_type in ['revolute', 'prismatic']:
-                self.joints.append(joint)
-                self.joint_names.append(joint.name)
-
-                # Add joint limits
-                if joint.limit is not None:
-                   lower = joint.limit.lower if joint.limit.lower is not None else -np.pi
-                   upper = joint.limit.upper if joint.limit.upper is not None else np.pi
-                   self.joint_limits.append((lower, upper))
-                else:
-                    self.joint_limits.append((-np.pi, np.pi))
-
-            # build serial kinematic chain, we assume one end effector 
-            # for this exercise
-            self.link_names = [link.name for link in self.robot.links]
-            self.end_effector_link = self.link_names[-1]
-
-            print(f"Loaded URDF with {len(self.joints)} joints.")
-            print(f"End-effector link: {self.end_effector_link}")
+        print(f"Loaded URDF with {len(self.joints)} joints.")
+        print(f"End-effector link: {self.end_effector_link}")
 
     # Returns one ndarray of shape (4,4) - a transfromation matrix that
     # encodes the position and rotation of the end effector
@@ -170,6 +167,32 @@ def plan_trajectory(current_joints: dict[str, float],
         forming a smooth path from the current configuration to one that
         achieves the desired end-effector pose.
     """
+    solver = URDFKinematicsSolver("xarm6.urdf")
+    
+    # Joint name mapping
+    mapping = {"base": "joint1", "shoulder": "joint2", "elbow": "joint3", 
+               "wrist_pan": "joint4", "wrist_tilt": "joint5", "wrist_roll": "joint6"}
+    reverse_map = {v: k for k, v in mapping.items()}
+    
+    # Convert to solver format
+    current_q = [current_joints.get(reverse_map.get(name, name), 0.0) 
+                 for name in solver.joint_names]
+    
+    # Convert desired pose to transformation matrix
+    x, y, z, roll, pitch, yaw = desired_eef_pose
+    target_transform = np.eye(4)
+    target_transform[:3, 3] = [x, y, z]
+    target_transform[:3, :3] = R.from_euler('xyz', [roll, pitch, yaw]).as_matrix()
+    
+    # Solve inverse kinematics (handles multiple initial guesses internally)
+    target_q, success = solver.inverse_kinematics(target_transform)
+    
+    # Generate path and convert back to dict format
+    path = solver.interpolate_path(current_q, target_q)
+    return [{reverse_map.get(name, name): q[i] 
+             for i, name in enumerate(solver.joint_names)} 
+            for q in path]
+
 def time_parameterize_trajectory(
         waypoints: list[dict[str, float]],
         max_vel: float = 1.0,
@@ -187,18 +210,19 @@ def time_parameterize_trajectory(
 
 
 def main():
-    current_joints = {
-        "joint1": 0.0,
-        "joint2": 0.0,
-        "joint3": 0.0
-    }
-    desired_eef_pose = (1.0, 0.0, 0.5, 0.0, 0.0, 0.0)
+    current_joints = {"base": 0.0, "shoulder": 0.0, "elbow": 1.578, 
+                     "wrist_pan": 0.0, "wrist_tilt": -1.57, "wrist_roll": 0.0}
+   
+    desired_pose = (0.5, 0.3, 0.6, 0.0, 0.0, 0.0)
+   
+    print(f"Current: {current_joints}")
+    print(f"Target:  {desired_pose}")
+    
+    # Plan and time-parameterize trajectory
+    waypoints = plan_trajectory(current_joints, desired_pose)
 
-    waypoints = plan_trajectory(current_joints, desired_eef_pose)
-    timed_trajectory = time_parameterize_trajectory(waypoints)  
-    for t, joint_angles in timed_trajectory:
-        print(f"Time: {t:.2f}, Joint Angles: {joint_angles}")
-
+    waypoints = plan_trajectory(current_joints, desired_pose)
+    print(f"Generated {len(waypoints)} waypoints")
 
 if __name__ == "__main__":
     main()
