@@ -357,6 +357,28 @@ def main():
     print(f"Generated {len(timed_trajectory)} timed trajectory points")
     print(f"Total trajectory duration: {timed_trajectory[-1][0]:.2f} seconds")
 
+    print("Verifying final pose...")
+    try:
+        solver = URDFKinematicsSolver()
+        final_joints = timed_trajectory[-1][1]
+        
+        # Convert to list format for forward kinematics (no mapping needed!)
+        final_q = [final_joints.get(joint, 0.0) for joint in solver.joint_names]
+        T_final = solver.forward_kinematics(final_q)
+        pos_final, quat_final = solver.get_pose_from_transform(T_final)
+        
+        # Convert to RPY for comparison
+        rpy_final = R.from_quat(quat_final).as_euler('xyz')
+        final_pose = (*pos_final, *rpy_final)
+        
+        pose_error = np.linalg.norm(np.array(final_pose) - np.array(desired_pose))
+        print(f"Achieved pose: {[f'{v:.3f}' for v in final_pose]}")
+        print(f"Desired pose:  {[f'{v:.3f}' for v in desired_pose]}")
+        print(f"Pose error:    {pose_error:.6f}")
+        
+    except Exception as e:
+        print(f"Pose verification failed: {e}")
+
     
 if __name__ == "__main__":
     main()
