@@ -3,7 +3,7 @@ import numpy as np
 import pybullet as p
 import pybullet_data
 from scipy.spatial.transform import Rotation as R
-from typing import List, Dict, Tuple
+from typing import List, Tuple
 
 
 class URDFKinematicsSolver:
