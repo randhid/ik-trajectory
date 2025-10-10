@@ -8,9 +8,10 @@ from typing import List, Dict, Tuple
 
 class URDFKinematicsSolver:
     """
-    A simple kinematics solver using URDF and inverse Jacobian method.
-    Uses urdfpy for URDF parsing and kinematics.
-    Uses Numpy and SciPy for numerical computations. 
+    A kinematics solver using PyBullet's built-in xarm6 and pseudo-inverse Jacobian method.
+    Uses PyBullet for URDF parsing and forward kinematics.
+    Uses numerical differentiation for Jacobian computation.
+    Joint names: joint1, joint2, joint3, joint4, joint5, joint6
     """
 
     def __init__(self, urdf_path: str = None):
@@ -225,14 +226,7 @@ def plan_trajectory(current_joints: dict[str, float],
     """
     solver = URDFKinematicsSolver()  # Use built-in xarm6
     
-    # Joint name mapping
-    mapping = {"base": "joint1", "shoulder": "joint2", "elbow": "joint3", 
-               "wrist_pan": "joint4", "wrist_tilt": "joint5", "wrist_roll": "joint6"}
-    reverse_map = {v: k for k, v in mapping.items()}
-    
-    # Convert to solver format
-    current_q = [current_joints.get(reverse_map.get(name, name), 0.0) 
-                 for name in solver.joint_names]
+    current_q = [current_joints.get(name, 0.0) for name in solver.joint_names]
     
     # Convert desired pose to transformation matrix
     x, y, z, roll, pitch, yaw = desired_eef_pose
@@ -240,17 +234,14 @@ def plan_trajectory(current_joints: dict[str, float],
     target_transform[:3, 3] = [x, y, z]
     target_transform[:3, :3] = R.from_euler('xyz', [roll, pitch, yaw]).as_matrix()
     
-    # Solve inverse kinematics (handles multiple initial guesses internally)
     target_q, success = solver.inverse_kinematics(target_transform)
     if not success:
         print("Warning: Inverse kinematics failed to converge to desired pose.")
         print("Using best attempt solution - may have some pose error.")
         # Use the last attempt even if not fully converged
     
-    # Generate path and convert back to dict format
     path = solver.interpolate_path(current_q, target_q)
-    return [{reverse_map.get(name, name): q[i] 
-             for i, name in enumerate(solver.joint_names)} 
+    return [{solver.joint_names[i]: q[i] for i in range(len(solver.joint_names))} 
             for q in path]
 
 def time_parameterize_trajectory(
@@ -268,20 +259,105 @@ def time_parameterize_trajectory(
         that satisfy velocity and acceleration bounds.
     """
 
+    # do not construct a splined cubic polynomial if we only have two waypoints, need a different solver
+    # or directly command the xarm to the target
+    if len(waypoints) < 2:
+        return [(0.0, waypoints[0])] if waypoints else []
+    
+    joint_names = list(waypoints[0].keys())
+    n_joints = len(joint_names)
+    n_waypoints = len(waypoints)
+    
+    q_waypoints = np.array([[wp[joint] for joint in joint_names] for wp in waypoints])
+    
+    # step 1: calculate initial time allocation based on distance and max velocity
+    segment_times = []
+    for i in range(n_waypoints - 1):
+        q_diff = q_waypoints[i+1] - q_waypoints[i]
+        max_joint_diff = np.max(np.abs(q_diff))
+        # initial time estimate based on max velocity
+        # hopefully never zero diff but just in case there's a bug in my waypoint generator
+        dt = max_joint_diff / max_vel if max_joint_diff > 0 else 0.1
+        segment_times.append(dt)
+    
+    # step 2: iterate to adjust timing to satisfy acceleration constraints
+    # iterate 3 times to fix acceleration violations and get a smooth velocity profile
+    # based on waypoint distances - make sure no segment has too high acceleration
+    for iteration in range(3):
+        for i in range(len(segment_times)):
+            q_diff = q_waypoints[i+1] - q_waypoints[i]
+            dt = segment_times[i]
+            
+            # for cubic polynomial with zero boundary velocities:
+            # q(t) = a_0 + a_1t + a_2t^2 + a_3t^3
+            # initial conditions: q(t_0)=q_0, q'(0)=0, q(t_1)=q_1, q'(t_1)=0
+            # q is joint angle, q' is joint velocity
+            # peak acceleration is approximately 6*|q_diff|/dt^2
+            peak_acc = 6.0 * np.max(np.abs(q_diff)) / (dt * dt)
+            
+            if peak_acc > max_acc:
+                dt_new = np.sqrt(6.0 * np.max(np.abs(q_diff)) / max_acc)
+                segment_times[i] = max(dt, dt_new)
+
+    # step 3: build cubic polynomial coefficients for each segment and joint
+    trajectories = []
+    current_time = 0.0
+    trajectories.append((current_time, waypoints[0]))
+    
+    # generate trajectories for each segment
+    for seg_idx in range(n_waypoints - 1):
+        dt = segment_times[seg_idx]
+        q_start = q_waypoints[seg_idx]
+        q_end = q_waypoints[seg_idx + 1]
+        
+        # cubic polynomial coefficients for each joint
+        # q(t) = a_0 + a_1t + a_2t^2 + a_3t^3
+        # boundary conditions: q(0)=q_start, q'(0)=0, q(dt)=q_end, q'(dt)=0
+        a0 = q_start
+        a1 = np.zeros(n_joints)  # zero initial velocity
+        a2 = 3.0 * (q_end - q_start) / (dt * dt)
+        a3 = -2.0 * (q_end - q_start) / (dt * dt * dt)
+        
+        n_samples = max(10, int(dt * 50))  # 50 Hz sampling
+        for i in range(1, n_samples + 1):
+            t_local = (i / n_samples) * dt
+            t_global = current_time + t_local
+            
+            # use the cubic polynomial to evaluate at each time step t
+            q_t = a0 + a1 * t_local + a2 * (t_local**2) + a3 * (t_local**3)
+            
+            # convert back to dictionary format
+            joint_dict = {joint_names[j]: q_t[j] for j in range(n_joints)}
+            trajectories.append((t_global, joint_dict))
+        
+        current_time += dt
+    
+    return trajectories
+
 
 def main():
-    current_joints = {"base": 0.0, "shoulder": 0.0, "elbow": 1.578, 
-                     "wrist_pan": 0.0, "wrist_tilt": -1.57, "wrist_roll": 0.0}
+    # Use xarm joint names consistently (joint1, joint2, etc.)
+    current_joints = {"joint1": 0.0, "joint2": 0.0, "joint3": 1.578, 
+                     "joint4": 0.0, "joint5": -1.57, "joint6": 0.0}
    
     desired_pose = (0.5, 0.3, 0.6, 0.0, 0.0, 0.0)
    
-    print(f"Current: {current_joints}")
-    print(f"Target:  {desired_pose}")
+    print(f"Current joints: {current_joints}")
+    print(f"Target pose:    {desired_pose}")
     
     # Plan trajectory
     waypoints = plan_trajectory(current_joints, desired_pose)
-    print(f"Generated {len(waypoints)} waypoints")
+    print(f"Generated {len(waypoints)} spatial waypoints")
+    
+    # Time parameterize trajectory
+    max_vel = 1.0  # rad/s
+    max_acc = 2.0  # rad/s²
+    timed_trajectory = time_parameterize_trajectory(waypoints, max_vel, max_acc)
+    
+    print(f"Generated {len(timed_trajectory)} timed trajectory points")
+    print(f"Total trajectory duration: {timed_trajectory[-1][0]:.2f} seconds")
 
+    
 if __name__ == "__main__":
     main()
     
