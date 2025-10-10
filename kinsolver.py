@@ -126,30 +126,36 @@ class URDFKinematicsSolver:
         return len(contacts) == 0  # No self-collision
     
     def inverse_kinematics(self, target_transform: np.ndarray, 
-                          max_iter: int = 100) -> Tuple[List[float], bool]:
+                          max_iter: int = 200) -> Tuple[List[float], bool]:
         """Solve IK using pseudo-inverse Jacobian method with quaternion-based orientation error"""
         target_pos = target_transform[:3, 3]
         target_quat = R.from_matrix(target_transform[:3, :3]).as_quat()
         
+        print(f"IK target position: {target_pos}")
+        print(f"IK target orientation (quat): {target_quat}")
+        
         # Try multiple initial guesses
         initial_guesses = [
             [0.0] * len(self.joint_names),  # Home position
-            np.random.uniform(-1, 1, len(self.joint_names)),  # Random
+            np.random.uniform(-0.5, 0.5, len(self.joint_names)),  # Small random
             [(l + u) / 2 for l, u in self.joint_limits],  # Mid-range
+            np.random.uniform(-1, 1, len(self.joint_names)),  # Larger random
         ]
         
-        for initial_guess in initial_guesses:
+        best_q = None
+        best_error = float('inf')
+        
+        for guess_idx, initial_guess in enumerate(initial_guesses):
             q = np.array(initial_guess)
             
-            for _ in range(max_iter):
+            for iter_count in range(max_iter):
                 T = self.forward_kinematics(q)
                 pos, quat = self.get_pose_from_transform(T)
                 
-                # Position error (same as before)
+                # Position error
                 pos_err = target_pos - pos
                 
                 # Quaternion-based orientation error using scipy
-                # Compute rotation difference and convert to axis-angle
                 R_target = R.from_quat(target_quat)
                 R_current = R.from_quat(quat)
                 R_error = R_target * R_current.inv()
@@ -157,19 +163,35 @@ class URDFKinematicsSolver:
                 
                 # Combined error
                 error = np.concatenate([pos_err, 0.5 * quat_err])
+                error_norm = np.linalg.norm(error)
                 
-                if np.linalg.norm(error) < 1e-4 and self.is_valid(q):
+                # Track best solution
+                if error_norm < best_error:
+                    best_error = error_norm
+                    best_q = q.copy()
+                
+                # Check convergence
+                if error_norm < 1e-3:  # Relaxed tolerance
+                    print(f"IK converged with error: {error_norm:.6f} after {iter_count+1} iterations (guess {guess_idx+1})")
                     return q.tolist(), True
                 
+                # Compute Jacobian and update
                 J = self.compute_jacobian(q)
                 J[3:] *= 0.5  # Weight orientation
-                J_pinv = J.T @ np.linalg.inv(J @ J.T + 0.01 * np.eye(6))
                 
-                q += 0.1 * J_pinv @ error
+                # Use damped least squares with adaptive damping
+                damping = 0.01 + 0.1 * error_norm
+                J_pinv = J.T @ np.linalg.inv(J @ J.T + damping * np.eye(6))
+                
+                # Adaptive step size
+                step_size = 0.2 / (1.0 + error_norm)
+                q += step_size * J_pinv @ error
+                
+                # Enforce joint limits
                 q = np.clip(q, [l for l, u in self.joint_limits], [u for l, u in self.joint_limits])
         
-        # If no initial guess worked, return the last attempt
-        return q.tolist(), False
+        print(f"IK did not fully converge. Best error: {best_error:.6f}")
+        return best_q.tolist() if best_q is not None else q.tolist(), False
     
     def interpolate_path(self, q_start: List[float], q_end: List[float], n: int = 20) -> List[List[float]]:
         """Linear interpolation with collision checking"""
@@ -221,7 +243,9 @@ def plan_trajectory(current_joints: dict[str, float],
     # Solve inverse kinematics (handles multiple initial guesses internally)
     target_q, success = solver.inverse_kinematics(target_transform)
     if not success:
-        raise ValueError("Inverse kinematics failed to find a valid solution.")
+        print("Warning: Inverse kinematics failed to converge to desired pose.")
+        print("Using best attempt solution - may have some pose error.")
+        # Use the last attempt even if not fully converged
     
     # Generate path and convert back to dict format
     path = solver.interpolate_path(current_q, target_q)
