@@ -75,6 +75,31 @@ class URDFKinematicsSolver:
         rotation_matrix = T[:3, :3]
         orientation_quat = R.from_matrix(rotation_matrix).as_quat()
         return position, orientation_quat
+    
+    def is_valid(self, q: List[float]) -> bool:
+        """Check joint limits and basic collision avoidance"""
+        # Joint limits
+        for i, angle in enumerate(q):
+            if i < len(self.joint_limits):
+                lower, upper = self.joint_limits[i]
+                if not (lower <= angle <= upper):
+                    return False
+        
+        # Simple self-collision check (distance-based)
+        try:
+            joint_cfg = {name: q[i] if i < len(q) else 0.0 
+                        for i, name in enumerate(self.joint_names)}
+            fk = self.robot.link_fk(cfg=joint_cfg)
+            positions = [T[:3, 3] for T in fk.values()]
+            
+            for i in range(len(positions)):
+                for j in range(i + 2, len(positions)):
+                    if np.linalg.norm(positions[i] - positions[j]) < 0.1:
+                        return True  # Collision
+            return False
+        except:
+            return False
+    
 
 def plan_trajectory(current_joints: dict[str, float],
                     desired_eef_pose: tuple[float, float, float, float, float, float]
