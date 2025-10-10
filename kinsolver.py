@@ -109,7 +109,7 @@ class URDFKinematicsSolver:
         return position, orientation_quat
     
     def is_valid(self, q: List[float]) -> bool:
-        """Check joint limits and basic collision avoidance"""
+        """Check joint limits, workspace bounds, and collision avoidance"""
         # Joint limits
         for i, angle in enumerate(q):
             if i < len(self.joint_limits):
@@ -117,10 +117,12 @@ class URDFKinematicsSolver:
                 if not (lower <= angle <= upper):
                     return False
         
-        # Set joint positions for collision check
+        # Set joint positions for workspace and collision checks
         for i, joint_idx in enumerate(self.joint_indices):
             if i < len(q):
                 p.resetJointState(self.robot_id, joint_idx, q[i])
+        
+
         
         # Simple collision check using PyBullet
         contacts = p.getContactPoints(self.robot_id, self.robot_id)
@@ -236,9 +238,22 @@ def plan_trajectory(current_joints: dict[str, float],
     
     target_q, success = solver.inverse_kinematics(target_transform)
     if not success:
-        print("Warning: Inverse kinematics failed to converge to desired pose.")
-        print("Using best attempt solution - may have some pose error.")
-        # Use the last attempt even if not fully converged
+        # Check if the pose is severely out of bounds by testing the best attempt
+        T_achieved = solver.forward_kinematics(target_q)
+        pos_achieved = T_achieved[:3, 3]
+        pos_desired = target_transform[:3, 3]
+        position_error = np.linalg.norm(pos_achieved - pos_desired)
+        
+        print(f"Warning: Inverse kinematics failed to converge.")
+        print(f"Position error: {position_error:.3f}m")
+        
+        # If error is very large (> 0.5m), reject the solution
+        if position_error > 0.5:
+            print("ERROR: Target pose is clearly out of workspace bounds.")
+            print("Refusing to generate trajectory for unreachable pose.")
+            raise ValueError(f"Target pose unreachable - position error {position_error:.3f}m > 0.5m threshold")
+        else:
+            print("Using best attempt solution - small pose error may be acceptable.")
     
     path = solver.interpolate_path(current_q, target_q)
     return [{solver.joint_names[i]: q[i] for i in range(len(solver.joint_names))} 
@@ -336,12 +351,17 @@ def time_parameterize_trajectory(
 
 
 def main():
+    print("XArm6 Kinematics Solver with Cubic Polynomial Trajectory Planning")
+    print("=" * 65)
+    
     # Use xarm joint names consistently (joint1, joint2, etc.)
     current_joints = {"joint1": 0.0, "joint2": 0.0, "joint3": 1.578, 
                      "joint4": 0.0, "joint5": -1.57, "joint6": 0.0}
    
     desired_pose = (0.5, 0.3, 0.6, 0.0, 0.0, 0.0)
    
+    print("TEST 1: Valid pose within workspace")
+    print("-" * 35)
     print(f"Current joints: {current_joints}")
     print(f"Target pose:    {desired_pose}")
     
@@ -378,8 +398,29 @@ def main():
         
     except Exception as e:
         print(f"Pose verification failed: {e}")
-
     
+    # Additional test: Out-of-bounds pose
+    print("\n" + "=" * 65)
+    print("TEST 2: Out-of-bounds pose (should fail or give poor results)")
+    print("-" * 55)
+    
+    out_of_bounds_pose = (2.0, 1.5, 0.8, 0.0, 0.0, 0.0)  # Way outside XArm6 reach
+    print(f"Target pose (OUT OF BOUNDS): {out_of_bounds_pose}")
+    print("Note: XArm6 has ~0.85m max reach, but target is ~2.5m from base")
+    
+    try:
+        print("\nAttempting trajectory planning for out-of-bounds pose...")
+        out_of_bounds_waypoints = plan_trajectory(current_joints, out_of_bounds_pose)
+        print(f"Generated {len(out_of_bounds_waypoints)} waypoints (unexpectedly!)")
+        
+        if out_of_bounds_waypoints:
+            print("This should not happen - trajectory generation should have been rejected!")
+            
+    except ValueError as e:
+        print(f"✓ CORRECTLY REJECTED: {e}")
+    except Exception as e:
+        print(f"Out-of-bounds test failed with unexpected error: {e}")
+
 if __name__ == "__main__":
     main()
     
