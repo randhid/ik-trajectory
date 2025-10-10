@@ -1,3 +1,48 @@
+import numpy as np
+from scipy.spatial.transform import Rotation as R
+from scipy.optimize import minimize
+from typing import List, Dict, Tuple
+import urdfpy
+
+
+class URDFKinematicsSolver:
+    """
+    A simple kinematics solver using URDF and inverse Jacobian method.
+    Uses urdfpy for URDF parsing and kinematics.
+    Uses Numpy and SciPy for numerical computations. 
+    """
+
+    def __init__(self, urdf_path: str):
+        self.urdf_path = urdf_path
+        self.robot = urdfpy.URDF.load(urdf_path)
+
+        ## Extract joint infromation from URDF
+        self.joints = []
+        self.joint_names = []
+        self.joint_limits = {}
+
+        for joint in self.robot.joints:
+            # We are only considering serial chains with joints that rotate or are linear
+            # As opposed to something like a hexbot which has spherical joints (3R in one joint)
+            if joint.joint_type in ['revolute', 'prismatic']:
+                self.joints.append(joint)
+                self.joint_names.append(joint.name)
+
+                # Add joint limits
+                if joint.limit is not None:
+                   lower = joint.limit.lower if joint.limit.lower is not None else -np.pi
+                   upper = joint.limit.upper if joint.limit.upper is not None else np.pi
+                   self.joint_limits.append((lower, upper))
+                else:
+                    self.joint_limits.append((-np.pi, np.pi))
+
+            # build serial kinematic chain, we assume one end effector 
+            # for this exercise
+            self.link_names = [link.name for link in self.robot.links]
+            self.end_effector_link = self.link_names[-1]
+
+            print(f"Loaded URDF with {len(self.joints)} joints.")
+            print(f"End-effector link: {self.end_effector_link}")
 
 
 def plan_trajectory(current_joints: dict[str, float],
