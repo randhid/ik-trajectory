@@ -360,91 +360,118 @@ def time_parameterize_trajectory(
     Output:
         List of (time, joint_dict) tuples giving absolute timestamps
         that satisfy velocity and acceleration bounds.
-
-    Creates smooth continuous motion using cubic splines with intermediate waypoints.
     """
 
     if len(waypoints) < 2:
         return [(0.0, waypoints[0])] if waypoints else []
 
     joint_names = list(waypoints[0].keys())
-    n_waypoints = len(waypoints)
+    q_waypoints = np.array([[wp[j] for j in joint_names] for wp in waypoints])
 
-    q_waypoints = np.array([[wp[joint] for joint in joint_names] for wp in waypoints])
+    # Basic sizes
+    n_wp = q_waypoints.shape[0]
+    n_joints = q_waypoints.shape[1]
+    vmax = max_vel
+    amax = max_acc
 
-    # step 1: Calculate time allocation based on velocity constraints between waypoints
+    # Per-joint forward/backward v^2 propagation (motion-cone inspired)
+    v_wp = np.full((n_wp, n_joints), vmax)
+    # endpoints stop
+    v_wp[0, :] = 0.0
+    v_wp[-1, :] = 0.0
+
+    # set zero velocity where there is no motion
+    for k in range(n_wp - 1):
+        zero_mask = np.isclose(q_waypoints[k + 1] - q_waypoints[k], 0.0)
+        v_wp[k, zero_mask] = 0.0
+
+    # Forward pass
+    for k in range(n_wp - 1):
+        D = np.abs(q_waypoints[k + 1] - q_waypoints[k])
+        for j in range(n_joints):
+            v_allow = np.sqrt(max(0.0, v_wp[k, j] ** 2 + 2.0 * amax * D[j]))
+            if v_wp[k + 1, j] > v_allow:
+                v_wp[k + 1, j] = v_allow
+
+    # Backward pass
+    for k in range(n_wp - 2, -1, -1):
+        D = np.abs(q_waypoints[k + 1] - q_waypoints[k])
+        for j in range(n_joints):
+            v_allow = np.sqrt(max(0.0, v_wp[k + 1, j] ** 2 + 2.0 * amax * D[j]))
+            if v_wp[k, j] > v_allow:
+                v_wp[k, j] = v_allow
+
+    # Compute per-segment times by taking the worst-case joint time
     segment_times = []
-    for i in range(n_waypoints - 1):
-        q_diff = q_waypoints[i + 1] - q_waypoints[i]
-        max_joint_diff = np.max(np.abs(q_diff))
-        # Use more conservative velocity for smoother motion
-        dt = max_joint_diff / (max_vel) if max_joint_diff > 0 else 0.1
-        segment_times.append(dt)
+    for k in range(n_wp - 1):
+        D = q_waypoints[k + 1] - q_waypoints[k]
+        dt_seg = 0.0
+        for j in range(n_joints):
+            Dj = abs(D[j])
+            v0 = v_wp[k, j]
+            v1 = v_wp[k + 1, j]
 
-    # step 2: Build cumulative time stamps for original waypoints
+            if Dj < 1e-8 and v0 == 0 and v1 == 0:
+                dt_j = 0.0
+            else:
+                denom = (abs(v0) + abs(v1))
+                if denom > 1e-8:
+                    dt_j = 2.0 * Dj / denom
+                else:
+                    dt_j = 2.0 * np.sqrt(Dj / max(1e-8, amax))
+
+            if dt_j > dt_seg:
+                dt_seg = dt_j
+
+        if dt_seg < 1e-3:
+            dt_seg = 0.05
+        segment_times.append(dt_seg)
+
+    # Build time stamps
     time_stamps = [0.0]
-    for dt in segment_times:
-        time_stamps.append(time_stamps[-1] + dt)
-
+    for dt_seg in segment_times:
+        time_stamps.append(time_stamps[-1] + dt_seg)
     total_time = time_stamps[-1]
 
-    # step 3: Create smooth cubic splines directly between original waypoints
-    # Use clamped boundary conditions for smooth start/stop motion
+    # Build clamped cubic splines (zero endpoint velocities)
     joint_splines = {}
     for j, joint_name in enumerate(joint_names):
         joint_values = q_waypoints[:, j]
-
-        # use clamped boundary conditions (zero velocity at start and end)
-        spline = CubicSpline(
-            time_stamps, joint_values, bc_type=((1, 0.0), (1, 0.0))
-        )  # Zero first derivative at both ends
+        spline = CubicSpline(time_stamps, joint_values, bc_type=((1, 0.0), (1, 0.0)))
         joint_splines[joint_name] = spline
 
-    # step 4: Check and adjust for velocity/acceleration constraints
-    test_times = np.linspace(0, total_time, max(100, int(total_time * 50)))
+    # Validate and apply single global scaling if needed
+    if total_time <= 0.0:
+        return [(0.0, {jn: float(joint_splines[jn](0.0)) for jn in joint_names})]
+
+    test_times = np.linspace(0.0, total_time, max(100, int(total_time * 50)))
     max_vel_violation = 0.0
     max_acc_violation = 0.0
-
-    for t in test_times[1:-1]:  # Skip endpoints
+    for t in test_times[1:-1]:
         for joint_name in joint_names:
             spline = joint_splines[joint_name]
+            v = abs(spline(t, 1))
+            a = abs(spline(t, 2))
+            if v > max_vel:
+                max_vel_violation = max(max_vel_violation, v / max_vel)
+            if a > max_acc:
+                max_acc_violation = max(max_acc_violation, a / max_acc)
 
-            # Check velocity constraint
-            velocity = abs(spline(t, 1))  # First derivative
-            if velocity > max_vel:
-                max_vel_violation = max(max_vel_violation, velocity / max_vel)
-
-            # Check acceleration constraint
-            acceleration = abs(spline(t, 2))  # Second derivative
-            if acceleration > max_acc:
-                max_acc_violation = max(max_acc_violation, acceleration / max_acc)
-
-    # scale time if constraints are violated
     max_violation = max(max_vel_violation, max_acc_violation)
     if max_violation > 1.0:
-        scale_factor = max_violation * 1.15  # 15% safety margin
+        scale_factor = max_violation * 1.15
         time_stamps = [t * scale_factor for t in time_stamps]
         total_time *= scale_factor
-
-        # recreate splines with scaled time
         for j, joint_name in enumerate(joint_names):
-            joint_values = q_waypoints[:, j]  # Use original waypoints
-            spline = CubicSpline(
-                time_stamps, joint_values, bc_type=((1, 0.0), (1, 0.0))
-            )
-            joint_splines[joint_name] = spline
+            joint_values = q_waypoints[:, j]
+            joint_splines[joint_name] = CubicSpline(time_stamps, joint_values, bc_type=((1, 0.0), (1, 0.0)))
 
-    # step 5: Sample the smooth splines at regular intervals
-    dt = 0.05  # 50ms timestep for smooth motion
+    # Sample at fixed dt
+    dt = 0.05
     trajectory_times = np.arange(0.0, total_time + dt, dt)
-
     trajectory_points = []
     for t in trajectory_times:
-        joint_positions = {}
-        for joint_name in joint_names:
-            # Evaluate the smooth spline at time t
-            joint_positions[joint_name] = float(joint_splines[joint_name](t))
-
+        joint_positions = {jn: float(joint_splines[jn](t)) for jn in joint_names}
         trajectory_points.append((t, joint_positions))
 
     return trajectory_points
