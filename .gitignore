@@ -110,3 +110,6 @@ cython_debug/
 
 # VS Code
 .vscode/
+
+# pngs
+*.png
