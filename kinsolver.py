@@ -1,7 +1,8 @@
 import os
 import numpy as np
 import pybullet as p
-import pybullet_data
+from typing import List, Tuple
+import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation as R
 from typing import List, Tuple
 
@@ -18,11 +19,11 @@ class URDFKinematicsSolver:
         # Initialize PyBullet in DIRECT mode (no GUI)
         self.physics_client = p.connect(p.DIRECT)
 
-        # Use PyBullet's built-in xarm6 if no path specified
+        # Use local xarm folder if no path specified
         if urdf_path is None or "xarm6" in urdf_path:
-            import pybullet_data
-
-            p.setAdditionalSearchPath(pybullet_data.getDataPath())
+            # Set search path to current directory to find local xarm folder
+            p.setAdditionalSearchPath(".")
+            print("Using local XArm6 model from ./xarm/")
             self.robot_id = p.loadURDF("xarm/xarm6_robot.urdf", useFixedBase=True)
         else:
             p.setAdditionalSearchPath(os.path.dirname(urdf_path))
@@ -287,10 +288,11 @@ def time_parameterize_trajectory(
     Output:
         List of (time, joint_dict) tuples giving absolute timestamps
         that satisfy velocity and acceleration bounds.
+        
+    Creates smooth continuous motion using cubic splines with intermediate waypoints.
     """
-
-    # do not construct a splined cubic polynomial if we only have two waypoints, need a different solver
-    # or directly command the xarm to the target
+    from scipy.interpolate import CubicSpline
+    
     if len(waypoints) < 2:
         return [(0.0, waypoints[0])] if waypoints else []
 
@@ -300,150 +302,289 @@ def time_parameterize_trajectory(
 
     q_waypoints = np.array([[wp[joint] for joint in joint_names] for wp in waypoints])
 
-    # step 1: calculate initial time allocation based on distance and max velocity
+    # step 1: Calculate time allocation based on velocity constraints between waypoints
     segment_times = []
     for i in range(n_waypoints - 1):
         q_diff = q_waypoints[i + 1] - q_waypoints[i]
         max_joint_diff = np.max(np.abs(q_diff))
-        # initial time estimate based on max velocity
-        # hopefully never zero diff but just in case there's a bug in my waypoint generator
-        dt = max_joint_diff / max_vel if max_joint_diff > 0 else 0.1
+        # Use more conservative velocity for smoother motion
+        dt = max_joint_diff / (max_vel * 0.8) if max_joint_diff > 0 else 0.1
         segment_times.append(dt)
 
-    # step 2: iterate to adjust timing to satisfy acceleration constraints
-    # iterate 3 times to fix acceleration violations and get a smooth velocity profile
-    # based on waypoint distances - make sure no segment has too high acceleration
-    for iteration in range(3):
-        for i in range(len(segment_times)):
-            q_diff = q_waypoints[i + 1] - q_waypoints[i]
-            dt = segment_times[i]
+    # step 2: Build cumulative time stamps for original waypoints
+    time_stamps = [0.0]
+    for dt in segment_times:
+        time_stamps.append(time_stamps[-1] + dt)
+    
+    total_time = time_stamps[-1]
+    
+    # step 3: Create smooth cubic splines directly between original waypoints
+    # Use clamped boundary conditions for smooth start/stop motion
+    joint_splines = {}
+    for j, joint_name in enumerate(joint_names):
+        joint_values = q_waypoints[:, j]
+        
+        # use clamped boundary conditions (zero velocity at start and end)
+        spline = CubicSpline(time_stamps, joint_values, 
+                           bc_type=((1, 0.0), (1, 0.0)))  # Zero first derivative at both ends
+        joint_splines[joint_name] = spline
+    
+    # step 4: Check and adjust for velocity/acceleration constraints
+    test_times = np.linspace(0, total_time, max(100, int(total_time * 50)))
+    max_vel_violation = 0.0
+    max_acc_violation = 0.0
+    
+    for t in test_times[1:-1]:  # Skip endpoints
+        for joint_name in joint_names:
+            spline = joint_splines[joint_name]
+            
+            # Check velocity constraint
+            velocity = abs(spline(t, 1))  # First derivative
+            if velocity > max_vel:
+                max_vel_violation = max(max_vel_violation, velocity / max_vel)
+            
+            # Check acceleration constraint  
+            acceleration = abs(spline(t, 2))  # Second derivative
+            if acceleration > max_acc:
+                max_acc_violation = max(max_acc_violation, acceleration / max_acc)
+    
+    # scale time if constraints are violated
+    max_violation = max(max_vel_violation, max_acc_violation)
+    if max_violation > 1.0:
+        scale_factor = max_violation * 1.15  # 15% safety margin
+        time_stamps = [t * scale_factor for t in time_stamps]
+        total_time *= scale_factor
+        
+        # recreate splines with scaled time
+        for j, joint_name in enumerate(joint_names):
+            joint_values = q_waypoints[:, j]  # Use original waypoints
+            spline = CubicSpline(time_stamps, joint_values, 
+                               bc_type=((1, 0.0), (1, 0.0)))
+            joint_splines[joint_name] = spline
+    
+    # step 5: Sample the smooth splines at regular intervals
+    dt = 0.05  # 50ms timestep for smooth motion
+    trajectory_times = np.arange(0.0, total_time + dt, dt)
+    
+    trajectory_points = []
+    for t in trajectory_times:
+        joint_positions = {}
+        for joint_name in joint_names:
+            # Evaluate the smooth spline at time t
+            joint_positions[joint_name] = float(joint_splines[joint_name](t))
+        
+        trajectory_points.append((t, joint_positions))
+    
+    return trajectory_points
 
-            # for cubic polynomial with zero boundary velocities:
-            # q(t) = a_0 + a_1t + a_2t^2 + a_3t^3
-            # initial conditions: q(t_0)=q_0, q'(0)=0, q(t_1)=q_1, q'(t_1)=0
-            # q is joint angle, q' is joint velocity
-            # peak acceleration is approximately 6*|q_diff|/dt^2
-            peak_acc = 6.0 * np.max(np.abs(q_diff)) / (dt * dt)
 
-            if peak_acc > max_acc:
-                dt_new = np.sqrt(6.0 * np.max(np.abs(q_diff)) / max_acc)
-                segment_times[i] = max(dt, dt_new)
+def plot_combined_trajectory(solver, timed_trajectory: list[tuple[float, dict[str, float]]], 
+                           title: str = "XArm6 Trajectory Analysis"):
+    """Plot end-effector 3D trajectory and joint angles in a single figure"""
+    if not timed_trajectory:
+        print("No trajectory data to plot")
+        return
+    
+    # Create figure with two subplots side by side
+    fig = plt.figure(figsize=(18, 8))
+    
+    # Left subplot: 3D end-effector trajectory
+    ax_3d = fig.add_subplot(121, projection='3d')
+    
+    # Extract end-effector positions throughout trajectory
+    times = [t for t, _ in timed_trajectory]
+    ee_positions = []
+    
+    for time, joints in timed_trajectory:
+        joint_values = [joints.get(joint, 0.0) for joint in solver.joint_names]
+        
+        # Set joint positions in PyBullet to get forward kinematics
+        for i, joint_idx in enumerate(solver.joint_indices):
+            if i < len(joint_values):
+                p.resetJointState(solver.robot_id, joint_idx, joint_values[i])
+        
+        # Get end-effector position (last link)
+        end_effector_idx = len(solver.joint_indices) - 1
+        if end_effector_idx < p.getNumJoints(solver.robot_id):
+            link_state = p.getLinkState(solver.robot_id, end_effector_idx)
+            ee_positions.append(link_state[0])
+    
+    ee_positions = np.array(ee_positions)
+    
+    # Create color gradient from blue to red based on time progression
+    colors_3d = plt.cm.viridis(np.linspace(0, 1, len(timed_trajectory)))
+    
+    # Plot 3D trajectory as scatter points with color gradient
+    ax_3d.scatter(ee_positions[:, 0], ee_positions[:, 1], ee_positions[:, 2], 
+                  c=colors_3d, s=60, alpha=0.8, edgecolors='black', linewidth=0.5)
+    
+    # Mark start and end points
+    ax_3d.scatter(ee_positions[0, 0], ee_positions[0, 1], ee_positions[0, 2], 
+                  c='green', s=150, marker='o', label='Start', edgecolors='black', linewidth=2)
+    ax_3d.scatter(ee_positions[-1, 0], ee_positions[-1, 1], ee_positions[-1, 2], 
+                  c='red', s=150, marker='s', label='End', edgecolors='black', linewidth=2)
+    
+    ax_3d.set_xlabel('X (m)', fontsize=12)
+    ax_3d.set_ylabel('Y (m)', fontsize=12)
+    ax_3d.set_zlabel('Z (m)', fontsize=12)
+    ax_3d.set_title('End-Effector 3D Trajectory', fontsize=14, fontweight='bold')
+    ax_3d.legend(fontsize=10)
+    ax_3d.grid(True, alpha=0.3)
+    
+    # Right subplot: Joint angle time graphs
+    ax_joints = fig.add_subplot(122)
+    
+    joint_names = list(timed_trajectory[0][1].keys())
+    colors_joints = plt.cm.tab10(np.arange(len(joint_names)))
+    
+    for i, joint_name in enumerate(joint_names):
+        joint_values = [joints[joint_name] for _, joints in timed_trajectory]
+        ax_joints.scatter(times, joint_values, label=joint_name, 
+                         color=colors_joints[i], s=20, alpha=0.7, edgecolors='black', linewidth=0.3)
+    
+    ax_joints.set_xlabel('Time (s)', fontsize=12)
+    ax_joints.set_ylabel('Joint Angle (rad)', fontsize=12)
+    ax_joints.set_title('Joint Angles vs Time', fontsize=14, fontweight='bold')
+    ax_joints.grid(True, alpha=0.3)
+    ax_joints.legend(fontsize=10, loc='best')
+    
+    # Add minor ticks for better readability
+    ax_joints.minorticks_on()
+    ax_joints.grid(which='minor', alpha=0.15)
+    
+    plt.tight_layout()
+    plt.suptitle(title, y=0.98, fontsize=16, fontweight='bold')
+    plt.show()
 
-    # step 3: build cubic polynomial coefficients for each segment and joint
-    trajectories = []
-    current_time = 0.0
-    trajectories.append((current_time, waypoints[0]))
-
-    # generate trajectories for each segment
-    for seg_idx in range(n_waypoints - 1):
-        dt = segment_times[seg_idx]
-        q_start = q_waypoints[seg_idx]
-        q_end = q_waypoints[seg_idx + 1]
-
-        # cubic polynomial coefficients for each joint
-        # q(t) = a_0 + a_1t + a_2t^2 + a_3t^3
-        # boundary conditions: q(0)=q_start, q'(0)=0, q(dt)=q_end, q'(dt)=0
-        a0 = q_start
-        a1 = np.zeros(n_joints)  # zero initial velocity
-        a2 = 3.0 * (q_end - q_start) / (dt * dt)
-        a3 = -2.0 * (q_end - q_start) / (dt * dt * dt)
-
-        n_samples = max(10, int(dt * 50))  # 50 Hz sampling
-        for i in range(1, n_samples + 1):
-            t_local = (i / n_samples) * dt
-            t_global = current_time + t_local
-
-            # use the cubic polynomial to evaluate at each time step t
-            q_t = a0 + a1 * t_local + a2 * (t_local**2) + a3 * (t_local**3)
-
-            # convert back to dictionary format
-            joint_dict = {joint_names[j]: q_t[j] for j in range(n_joints)}
-            trajectories.append((t_global, joint_dict))
-
-        current_time += dt
-
-    return trajectories
-
-
-def main():
-    print("XArm6 Kinematics Solver with Cubic Polynomial Trajectory Planning")
-    print("=" * 65)
-
-    # Use xarm joint names consistently (joint1, joint2, etc.)
-    current_joints = {
-        "joint1": 0.0,
-        "joint2": 0.0,
-        "joint3": 1.578,
-        "joint4": 0.0,
-        "joint5": -1.57,
-        "joint6": 0.0,
-    }
-
-    desired_pose = (0.5, 0.3, 0.6, 0.0, 0.0, 0.0)
-
-    print("TEST 1: Valid pose within workspace")
-    print("-" * 35)
-    print(f"Current joints: {current_joints}")
-    print(f"Target pose:    {desired_pose}")
-
-    # Plan trajectory
-    waypoints = plan_trajectory(current_joints, desired_pose)
-    print(f"Generated {len(waypoints)} spatial waypoints")
-
-    # Time parameterize trajectory
-    max_vel = 1.0  # rad/s
-    max_acc = 2.0  # rad/s²
-    timed_trajectory = time_parameterize_trajectory(waypoints, max_vel, max_acc)
-
-    print(f"Generated {len(timed_trajectory)} timed trajectory points")
-    print(f"Total trajectory duration: {timed_trajectory[-1][0]:.2f} seconds")
-
-    print("Verifying final pose...")
+def simulate_trajectory(solver, timed_trajectory: list[tuple[float, dict[str, float]]], 
+                       real_time: bool = True, speed_factor: float = 1.0):
+    """Simulate the robot moving through the trajectory in PyBullet's GUI"""
+    if not timed_trajectory:
+        print("No trajectory data to simulate")
+        return
+    
+    print(f"\nStarting trajectory simulation...")
+    print(f"Duration: {timed_trajectory[-1][0]:.2f} seconds")
+    print(f"Trajectory points: {len(timed_trajectory)}")
+    print("Close the PyBullet window to end simulation")
+    
+    # Create a new connection with GUI for visualization
+    sim_client = p.connect(p.GUI)
+    if sim_client < 0:
+        print("Failed to connect to PyBullet GUI")
+        return
+    
     try:
-        solver = URDFKinematicsSolver()
-        final_joints = timed_trajectory[-1][1]
-
-        # Convert to list format for forward kinematics (no mapping needed!)
-        final_q = [final_joints.get(joint, 0.0) for joint in solver.joint_names]
-        T_final = solver.forward_kinematics(final_q)
-        pos_final, quat_final = solver.get_pose_from_transform(T_final)
-
-        # Convert to RPY for comparison
-        rpy_final = R.from_quat(quat_final).as_euler("xyz")
-        final_pose = (*pos_final, *rpy_final)
-
-        pose_error = np.linalg.norm(np.array(final_pose) - np.array(desired_pose))
-        print(f"Achieved pose: {[f'{v:.3f}' for v in final_pose]}")
-        print(f"Desired pose:  {[f'{v:.3f}' for v in desired_pose]}")
-        print(f"Pose error:    {pose_error:.6f}")
-
+        # Set up the simulation environment
+        p.setGravity(0, 0, -9.81, physicsClientId=sim_client)
+        p.setRealTimeSimulation(0, physicsClientId=sim_client)  # Step simulation manually
+        
+        # Set search path for local xarm folder and load ground plane
+        p.setAdditionalSearchPath(".", physicsClientId=sim_client)
+        import pybullet_data
+        p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=sim_client)
+        plane_id = p.loadURDF("plane.urdf", physicsClientId=sim_client)
+        
+        # Load the robot from local xarm folder
+        start_pos = [0, 0, 0]
+        start_orientation = p.getQuaternionFromEuler([0, 0, 0])
+        robot_id = p.loadURDF("xarm/xarm6_robot.urdf", start_pos, start_orientation, 
+                              physicsClientId=sim_client)
+        
+        # Get joint information
+        joint_indices = []
+        for i in range(p.getNumJoints(robot_id, physicsClientId=sim_client)):
+            joint_info = p.getJointInfo(robot_id, i, physicsClientId=sim_client)
+            if joint_info[2] == p.JOINT_REVOLUTE:  # Only revolute joints
+                joint_indices.append(i)
+        
+        print(f"Found {len(joint_indices)} controllable joints")
+        
+        # Set camera to get a good view of the robot
+        p.resetDebugVisualizerCamera(
+            cameraDistance=2.0,
+            cameraYaw=45,
+            cameraPitch=-30,
+            cameraTargetPosition=[0.3, 0.3, 0.5],
+            physicsClientId=sim_client
+        )
+        
+        # Add some visual markers for trajectory points
+        trajectory_markers = []
+        sample_indices = range(0, len(timed_trajectory), max(1, len(timed_trajectory)//10))
+        
+        for idx in sample_indices:
+            time, joints = timed_trajectory[idx]
+            joint_values = [joints.get(joint, 0.0) for joint in solver.joint_names]
+            
+            # Set joint positions to get end-effector position
+            for i, joint_idx in enumerate(joint_indices):
+                if i < len(joint_values):
+                    p.resetJointState(robot_id, joint_idx, joint_values[i], 
+                                    physicsClientId=sim_client)
+            
+            # Get end-effector position
+            if len(joint_indices) > 0:
+                link_state = p.getLinkState(robot_id, joint_indices[-1], 
+                                          physicsClientId=sim_client)
+                ee_pos = link_state[0]
+                
+                # Add a small sphere marker at this trajectory point
+                marker_color = [1.0 - idx/len(timed_trajectory), 0.0, idx/len(timed_trajectory), 0.7]
+                marker_id = p.createVisualShape(p.GEOM_SPHERE, radius=0.02, 
+                                              rgbaColor=marker_color,
+                                              physicsClientId=sim_client)
+                marker_body = p.createMultiBody(baseMass=0, baseVisualShapeIndex=marker_id,
+                                              basePosition=ee_pos, 
+                                              physicsClientId=sim_client)
+                trajectory_markers.append(marker_body)
+        
+        # Simulate the trajectory
+        start_time = time.time()
+        
+        for trajectory_point in timed_trajectory:
+            # Extract time and joint values from trajectory point
+            trajectory_time = trajectory_point[0]  # First element is time
+            joints = trajectory_point[1]           # Second element is joint dict
+            
+            joint_values = [joints.get(joint, 0.0) for joint in solver.joint_names]
+            
+            # Set target joint positions
+            for i, joint_idx in enumerate(joint_indices):
+                if i < len(joint_values):
+                    p.setJointMotorControl2(
+                        robot_id, joint_idx,
+                        controlMode=p.POSITION_CONTROL,
+                        targetPosition=joint_values[i],
+                        maxVelocity=2.0,  # rad/s
+                        force=100,
+                        physicsClientId=sim_client
+                    )
+            
+            # Step the simulation
+            p.stepSimulation(physicsClientId=sim_client)
+            
+            # Control timing
+            if real_time:
+                target_time = trajectory_time / speed_factor
+                elapsed = time.time() - start_time
+                sleep_time = target_time - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+        
+        print("\nTrajectory simulation completed!")
+        print("The robot will remain in the final position.")
+        print("Close the PyBullet window when you're done viewing.")
+        
+        # Keep the simulation running until window is closed
+        try:
+            while True:
+                p.stepSimulation(physicsClientId=sim_client)
+                time.sleep(1/240)  # 240 Hz simulation
+        except KeyboardInterrupt:
+            print("Simulation interrupted by user")
+        
     except Exception as e:
-        print(f"Pose verification failed: {e}")
-
-    # Additional test: Out-of-bounds pose
-    print("\n" + "=" * 65)
-    print("TEST 2: Out-of-bounds pose (should fail or give poor results)")
-    print("-" * 55)
-
-    out_of_bounds_pose = (2.0, 1.5, 0.8, 0.0, 0.0, 0.0)  # Way outside XArm6 reach
-    print(f"Target pose (OUT OF BOUNDS): {out_of_bounds_pose}")
-    print("Note: XArm6 has ~0.85m max reach, but target is ~2.5m from base")
-
-    try:
-        print("\nAttempting trajectory planning for out-of-bounds pose...")
-        out_of_bounds_waypoints = plan_trajectory(current_joints, out_of_bounds_pose)
-        print(f"Generated {len(out_of_bounds_waypoints)} waypoints (unexpectedly!)")
-
-        if out_of_bounds_waypoints:
-            print(
-                "This should not happen - trajectory generation should have been rejected!"
-            )
-
-    except ValueError as e:
-        print(f"✓ CORRECTLY REJECTED: {e}")
-    except Exception as e:
-        print(f"Out-of-bounds test failed with unexpected error: {e}")
-
-
-if __name__ == "__main__":
-    main()
+        print(f"Simulation error: {e}")
+    finally:
+        p.disconnect(physicsClientId=sim_client)
