@@ -368,82 +368,84 @@ def time_parameterize_trajectory(
     joint_names = list(waypoints[0].keys())
     q_waypoints = np.array([[wp[j] for j in joint_names] for wp in waypoints])
 
-    # initial per-segment time allocation from max joint displacement
-    segment_times = []
-    for i in range(len(waypoints) - 1):
-        dq = q_waypoints[i + 1] - q_waypoints[i]
-        max_d = np.max(np.abs(dq))
-        dt = max_d / max_vel if (max_d > 0 and max_vel > 0) else 0.1
-        segment_times.append(dt)
+    n_joints = q_waypoints.shape[1]
 
-    time_stamps = [0.0]
-    for dt_seg in segment_times:
-        time_stamps.append(time_stamps[-1] + dt_seg)
-    total_time = max(time_stamps[-1], 1e-6)
-
-    # build cubic splines per joint
-    joint_splines = {jn: CubicSpline(time_stamps, q_waypoints[:, j], bc_type=((1, 0.0), (1, 0.0)))
-                     for j, jn in enumerate(joint_names)}
-
-    # Find minimal global time scaling k >= 1 by bisection so that
-    # velocities (scale 1/k) and accelerations (scale 1/k^2) are within limits.
-    def feasible_with_scale(k: float) -> bool:
-        T = total_time * k
-        n_samples = int(max(200, min(3000, max(1, int(T * 50)))))
-        test_times = np.linspace(0.0, T, n_samples)
-
-        # when scaling time by k, new spline derivatives scale: v' = v / k, a' = a / k^2
-        for t in test_times:
-            # map t back to original spline parameter: t_orig = t / k
-            to = t / k
-            for jn in joint_names:
-                s = joint_splines[jn]
-                v = abs(s(to, 1)) / k
-                a = abs(s(to, 2)) / (k * k)
-                if max_vel > 0 and v > max_vel + 1e-12:
-                    return False
-                if max_acc > 0 and a > max_acc + 1e-12:
-                    return False
-        return True
-
-    # quick check: if already feasible with k=1, keep it
-    if feasible_with_scale(1.0):
-        chosen_k = 1.0
+    # Parameterize path by u in [0,1] using chord-length spacing in joint-space
+    chord = np.linalg.norm(np.diff(q_waypoints, axis=0), axis=1)
+    cum = np.concatenate(([0.0], np.cumsum(chord)))
+    if cum[-1] == 0:
+        u_knots = np.linspace(0.0, 1.0, len(waypoints))
     else:
-        # find upper bound by doubling until feasible (cap to avoid runaway)
-        k_low = 1.0
-        k_high = 2.0
-        max_k_cap = 1e3
-        while k_high < max_k_cap and not feasible_with_scale(k_high):
-            k_high *= 2.0
+        u_knots = cum / cum[-1]
 
-        if k_high >= max_k_cap:
-            # fallback: use conservative scaling to guarantee safety
-            chosen_k = k_high
+    # build cubic splines q(u) per joint with clamped endpoint derivatives = 0
+    # This enforces q'(0)=q'(1)=0 so joint velocities/accelerations can start from rest
+    q_splines = [CubicSpline(u_knots, q_waypoints[:, j], bc_type=((1, 0.0), (1, 0.0))) for j in range(n_joints)]
+
+    # Discretize u for s(t) optimization
+    Ns = min(2000, max(400, len(waypoints) * 150))
+    u_grid = np.linspace(0.0, 1.0, Ns)
+    du = u_grid[1] - u_grid[0]
+
+    # evaluate q'(u) and q''(u) on grid (shape Ns x n_joints)
+    qd = np.zeros((Ns, n_joints))
+    qdd = np.zeros((Ns, n_joints))
+    for j in range(n_joints):
+        qd[:, j] = q_splines[j](u_grid, 1)
+        qdd[:, j] = q_splines[j](u_grid, 2)
+
+    eps = 1e-12
+    # s_dot limits from velocity constraints: s_dot <= min_j max_vel / |q'_j|
+    sdot_lim_vel = np.min(np.where(np.abs(qd) > eps, max_vel / np.abs(qd), np.inf), axis=1)
+    # s_ddot conservative limit from accel: s_ddot <= min_j max_acc / |q'_j|
+    sddot_lim = np.min(np.where(np.abs(qd) > eps, max_acc / np.abs(qd), np.inf), axis=1)
+
+    # initialize s_dot to velocity limits, but start from rest (ramp-up)
+    s_dot = sdot_lim_vel.copy()
+    # enforce starting from rest: s_dot(0) = 0 so the time-scaling will ramp up
+    s_dot[0] = 0.0
+
+    # forward/backward pass to enforce acceleration limits (approximate)
+    # forward
+    for i in range(Ns - 1):
+        ds = du
+        vmax_next = np.sqrt(max(0.0, s_dot[i] * s_dot[i] + 2.0 * sddot_lim[i] * ds))
+        if s_dot[i + 1] > vmax_next:
+            s_dot[i + 1] = vmax_next
+    # backward
+    for i in range(Ns - 2, -1, -1):
+        ds = du
+        vmax_prev = np.sqrt(max(0.0, s_dot[i + 1] * s_dot[i + 1] + 2.0 * sddot_lim[i] * ds))
+        if s_dot[i] > vmax_prev:
+            s_dot[i] = vmax_prev
+
+    # compute time stamps by trapezoidal integration over s-grid
+    t_grid = np.zeros(Ns)
+    for i in range(Ns - 1):
+        sd1 = s_dot[i]
+        sd2 = s_dot[i + 1]
+        if sd1 + sd2 <= 1e-12:
+            dt = 1e6
         else:
-            # bisection to find minimal feasible k
-            for _ in range(40):
-                k_mid = 0.5 * (k_low + k_high)
-                if feasible_with_scale(k_mid):
-                    k_high = k_mid
-                else:
-                    k_low = k_mid
-            chosen_k = k_high
+            dt = 2.0 * du / (sd1 + sd2)
+        t_grid[i + 1] = t_grid[i] + dt
 
-    # apply chosen scaling to timestamps and rebuild splines
-    time_stamps = [t * chosen_k for t in time_stamps]
-    total_time *= chosen_k
-    joint_splines = {jn: CubicSpline(time_stamps, q_waypoints[:, j], bc_type=((1, 0.0), (1, 0.0)))
-                     for j, jn in enumerate(joint_names)}
+    total_time = t_grid[-1]
 
-    # Per-segment compression removed: keep global time-scaling result (chosen_k) to ensure prompt runtime.
+    # sample final trajectory at fixed dt
+    dt_out = 0.05
+    if total_time <= 0:
+        return [(0.0, {jn: float(q_splines[j](0.0)) for j, jn in enumerate(joint_names)})]
 
-    # sample at fixed dt
-    dt = 0.05
-    trajectory_times = np.arange(0.0, total_time + dt, dt)
+    times = np.arange(0.0, total_time + dt_out, dt_out)
+
+    # invert t_grid(u) to get u(t) via interpolation
+    u_of_t = np.interp(times, t_grid, u_grid)
+
+    # Evaluate joint splines at u_of_t to produce joint positions over time
     trajectory_points = []
-    for t in trajectory_times:
-        joint_positions = {jn: float(joint_splines[jn](t)) for jn in joint_names}
-        trajectory_points.append((t, joint_positions))
+    for tt, uu in zip(times, u_of_t):
+        joint_positions = {joint_names[j]: float(q_splines[j](uu)) for j in range(n_joints)}
+        trajectory_points.append((float(tt), joint_positions))
 
     return trajectory_points
