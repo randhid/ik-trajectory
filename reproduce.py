@@ -23,6 +23,7 @@ def main():
         "joint6": 0.0,
     }
 
+    # x, y, z, roll, putch, yaw
     desired_pose = (0.5, 0.3, 0.6, 0.0, 0.0, 0.0)
 
     print(f"Start joints: {current_joints}")
@@ -70,7 +71,6 @@ def main():
 
     print("\nStep 6: Verifying final pose...")
     try:
-        solver = kinsolver.URDFKinematicsSolver()
         final_joints = timed_trajectory[-1][1]
         final_q = [final_joints.get(joint, 0.0) for joint in solver.joint_names]
         T_final = solver.forward_kinematics(final_q)
