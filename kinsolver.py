@@ -162,6 +162,10 @@ class URDFKinematicsSolver:
         best_q = None
         best_error = float("inf")
         convergence_data = []  # Store convergence info for logging
+        all_solutions = []  # Store all converged solutions
+
+        if verbose:
+            print(f"Trying {len(initial_guesses)} different initial guesses...")
 
         for guess_idx, initial_guess in enumerate(initial_guesses):
             q = np.array(initial_guess)
@@ -206,17 +210,26 @@ class URDFKinematicsSolver:
                     # Store the best convergence data
                     convergence_data = guess_convergence.copy()
 
-                # Check convergence
+                # Check convergence - but don't return, continue with other guesses
                 if error_norm < 1e-3:  # Relaxed tolerance
                     if verbose:
-                        print(f"IK converged with error: {error_norm:.6f} after {iter_count+1} iterations (guess {guess_idx+1})")
+                        print(f"  Guess {guess_idx+1} CONVERGED with error: {error_norm:.6f} after {iter_count+1} iterations")
                         # Print convergence summary
                         if len(guess_convergence) > 1:
                             initial_err = guess_convergence[0]['total_error']
                             final_err = guess_convergence[-1]['total_error']
                             improvement = (initial_err - final_err) / initial_err * 100
-                            print(f"  Error improved from {initial_err:.6f} to {final_err:.6f} ({improvement:.1f}% reduction)")
-                    return q.tolist(), True
+                            print(f"    Error improved from {initial_err:.6f} to {final_err:.6f} ({improvement:.1f}% reduction)")
+                    
+                    # Store this solution but continue with other guesses
+                    all_solutions.append({
+                        'guess_idx': guess_idx,
+                        'q': q.copy(),
+                        'error': error_norm,
+                        'iterations': iter_count + 1,
+                        'convergence_data': guess_convergence.copy()
+                    })
+                    break  # This guess converged, move to next guess
 
                 # Compute Jacobian and update
                 J = self.compute_jacobian(q)
@@ -237,17 +250,32 @@ class URDFKinematicsSolver:
                     [u for l, u in self.joint_limits],
                 )
 
+        # Analyze all solutions
         if verbose:
-            print(f"IK did not fully converge. Best error: {best_error:.6f}")
-            # Print detailed convergence analysis
-            if convergence_data:
-                initial_err = convergence_data[0]['total_error']
-                final_err = convergence_data[-1]['total_error']
-                improvement = (initial_err - final_err) / initial_err * 100
-                print(f"  Error improved from {initial_err:.6f} to {final_err:.6f} ({improvement:.1f}% reduction)")
-                print(f"  Final position error: {convergence_data[-1]['position_error']:.6f}m")
-                print(f"  Final orientation error: {convergence_data[-1]['orientation_error']:.6f}rad")
-        return best_q.tolist() if best_q is not None else q.tolist(), False
+            print(f"\nIK Analysis Summary:")
+            print(f"  Converged solutions: {len(all_solutions)}/{len(initial_guesses)}")
+            if all_solutions:
+                print(f"  Best convergence: Guess {all_solutions[0]['guess_idx']+1} with error {all_solutions[0]['error']:.6f}")
+        
+        if all_solutions:
+            # Return the best converged solution
+            best_solution = min(all_solutions, key=lambda x: x['error'])
+            if verbose:
+                print(f"  Selected: Guess {best_solution['guess_idx']+1} (error: {best_solution['error']:.6f})")
+            return best_solution['q'].tolist(), True
+        else:
+            # No solution converged, return best attempt
+            if verbose:
+                print(f"  No solutions converged. Best error: {best_error:.6f}")
+                # Print detailed convergence analysis
+                if convergence_data:
+                    initial_err = convergence_data[0]['total_error']
+                    final_err = convergence_data[-1]['total_error']
+                    improvement = (initial_err - final_err) / initial_err * 100
+                    print(f"    Error improved from {initial_err:.6f} to {final_err:.6f} ({improvement:.1f}% reduction)")
+                    print(f"    Final position error: {convergence_data[-1]['position_error']:.6f}m")
+                    print(f"    Final orientation error: {convergence_data[-1]['orientation_error']:.6f}rad")
+            return best_q.tolist() if best_q is not None else q.tolist(), False
 
     def interpolate_path(
         self, q_start: List[float], q_end: List[float], n: int = 20
