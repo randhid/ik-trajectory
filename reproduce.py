@@ -27,8 +27,6 @@ def main():
 
     print(f"Start joints: {current_joints}")
     print(f"Target pose:  {desired_pose}")
-
-    # Step 1: Plan trajectory
     print("\nStep 1: Planning trajectory...")
     try:
         waypoints = kinsolver.plan_trajectory(current_joints, desired_pose)
@@ -37,7 +35,6 @@ def main():
         print(f"✗ Trajectory planning failed: {e}")
         return
 
-    # Step 2: Time parameterize trajectory
     print("\nStep 2: Time parameterizing trajectory...")
     max_vel = 1.0  # rad/s
     max_acc = 2.0  # rad/s²
@@ -52,21 +49,18 @@ def main():
         print(f"✗ Time parameterization failed: {e}")
         return
 
-    # Step 3: Save trajectory to CSV
     print("\nStep 3: Saving trajectory to CSV...")
     try:
         save_trajectory_csv(timed_trajectory, "traj.csv")
     except Exception as e:
         print(f"✗ CSV saving failed: {e}")
 
-    # Step 4: Generate and save plots
     print("\nStep 4: Generating position and velocity plots...")
     try:
         plot_positions_and_velocities(timed_trajectory)
     except Exception as e:
         print(f"✗ Plotting failed: {e}")
 
-    # Step 5: Generate combined trajectory plot
     print("\nStep 5: Generating combined trajectory plot...")
     try:
         solver = kinsolver.URDFKinematicsSolver()
@@ -74,7 +68,6 @@ def main():
     except Exception as e:
         print(f"✗ Combined plotting failed: {e}")
 
-    # Step 6: Verify final pose
     print("\nStep 6: Verifying final pose...")
     try:
         solver = kinsolver.URDFKinematicsSolver()
