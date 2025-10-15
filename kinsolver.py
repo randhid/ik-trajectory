@@ -130,14 +130,26 @@ class URDFKinematicsSolver:
         return len(contacts) == 0  # No self-collision
 
     def inverse_kinematics(
-        self, target_transform: np.ndarray, max_iter: int = 200
+        self, target_transform: np.ndarray, max_iter: int = 200, verbose: bool = False
     ) -> Tuple[List[float], bool]:
-        """Solve IK using pseudo-inverse Jacobian method with quaternion-based orientation error"""
+        """Solve IK using pseudo-inverse Jacobian method with quaternion-based orientation error
+        
+        Args:
+            target_transform: 4x4 target transformation matrix
+            max_iter: Maximum number of iterations
+            verbose: If True, prints detailed convergence information
+        
+        Returns:
+            Tuple containing:
+            - Joint angles (list)
+            - Success flag (bool)
+        """
         target_pos = target_transform[:3, 3]
         target_quat = R.from_matrix(target_transform[:3, :3]).as_quat()
 
-        print(f"IK target position: {target_pos}")
-        print(f"IK target orientation (quat): {target_quat}")
+        if verbose:
+            print(f"IK target position: {target_pos}")
+            print(f"IK target orientation (quat): {target_quat}")
 
         # Try multiple initial guesses
         initial_guesses = [
@@ -149,9 +161,11 @@ class URDFKinematicsSolver:
 
         best_q = None
         best_error = float("inf")
+        convergence_data = []  # Store convergence info for logging
 
         for guess_idx, initial_guess in enumerate(initial_guesses):
             q = np.array(initial_guess)
+            guess_convergence = []  # Track convergence for this guess
 
             for iter_count in range(max_iter):
                 T = self.forward_kinematics(q)
@@ -159,27 +173,49 @@ class URDFKinematicsSolver:
 
                 # Position error
                 pos_err = target_pos - pos
+                pos_err_norm = np.linalg.norm(pos_err)
 
                 # Quaternion-based orientation error using scipy
                 R_target = R.from_quat(target_quat)
                 R_current = R.from_quat(quat)
                 R_error = R_target * R_current.inv()
                 quat_err = R_error.as_rotvec()
+                quat_err_norm = np.linalg.norm(quat_err)
 
                 # Combined error
                 error = np.concatenate([pos_err, 0.5 * quat_err])
                 error_norm = np.linalg.norm(error)
 
-                # Track best solution
+                # Store convergence data for analysis
+                guess_convergence.append({
+                    'iteration': iter_count,
+                    'total_error': error_norm,
+                    'position_error': pos_err_norm,
+                    'orientation_error': quat_err_norm
+                })
+
+                # Verbose logging every 10 iterations or on convergence
+                if verbose and (iter_count % 10 == 0 or error_norm < 1e-3):
+                    print(f"  Guess {guess_idx+1}, Iter {iter_count+1}: "
+                          f"Total={error_norm:.6f}, Pos={pos_err_norm:.6f}, Ori={quat_err_norm:.6f}")
+
+                # Track best solution across all guesses
                 if error_norm < best_error:
                     best_error = error_norm
                     best_q = q.copy()
+                    # Store the best convergence data
+                    convergence_data = guess_convergence.copy()
 
                 # Check convergence
                 if error_norm < 1e-3:  # Relaxed tolerance
-                    print(
-                        f"IK converged with error: {error_norm:.6f} after {iter_count+1} iterations (guess {guess_idx+1})"
-                    )
+                    if verbose:
+                        print(f"IK converged with error: {error_norm:.6f} after {iter_count+1} iterations (guess {guess_idx+1})")
+                        # Print convergence summary
+                        if len(guess_convergence) > 1:
+                            initial_err = guess_convergence[0]['total_error']
+                            final_err = guess_convergence[-1]['total_error']
+                            improvement = (initial_err - final_err) / initial_err * 100
+                            print(f"  Error improved from {initial_err:.6f} to {final_err:.6f} ({improvement:.1f}% reduction)")
                     return q.tolist(), True
 
                 # Compute Jacobian and update
@@ -201,7 +237,16 @@ class URDFKinematicsSolver:
                     [u for l, u in self.joint_limits],
                 )
 
-        print(f"IK did not fully converge. Best error: {best_error:.6f}")
+        if verbose:
+            print(f"IK did not fully converge. Best error: {best_error:.6f}")
+            # Print detailed convergence analysis
+            if convergence_data:
+                initial_err = convergence_data[0]['total_error']
+                final_err = convergence_data[-1]['total_error']
+                improvement = (initial_err - final_err) / initial_err * 100
+                print(f"  Error improved from {initial_err:.6f} to {final_err:.6f} ({improvement:.1f}% reduction)")
+                print(f"  Final position error: {convergence_data[-1]['position_error']:.6f}m")
+                print(f"  Final orientation error: {convergence_data[-1]['orientation_error']:.6f}rad")
         return best_q.tolist() if best_q is not None else q.tolist(), False
 
     def interpolate_path(
@@ -248,7 +293,7 @@ def plan_trajectory(
     target_transform[:3, 3] = [x, y, z]
     target_transform[:3, :3] = R.from_euler("xyz", [roll, pitch, yaw]).as_matrix()
 
-    target_q, success = solver.inverse_kinematics(target_transform)
+    target_q, success = solver.inverse_kinematics(target_transform, verbose=True)
     if not success:
         # Check if the pose is severely out of bounds by testing the best attempt
         T_achieved = solver.forward_kinematics(target_q)
@@ -305,7 +350,7 @@ def time_parameterize_trajectory(
         q_diff = q_waypoints[i + 1] - q_waypoints[i]
         max_joint_diff = np.max(np.abs(q_diff))
         # Use more conservative velocity for smoother motion
-        dt = max_joint_diff / (max_vel * 0.8) if max_joint_diff > 0 else 0.1
+        dt = max_joint_diff / (max_vel) if max_joint_diff > 0 else 0.1
         segment_times.append(dt)
 
     # step 2: Build cumulative time stamps for original waypoints
