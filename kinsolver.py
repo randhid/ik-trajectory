@@ -368,105 +368,77 @@ def time_parameterize_trajectory(
     joint_names = list(waypoints[0].keys())
     q_waypoints = np.array([[wp[j] for j in joint_names] for wp in waypoints])
 
-    # Basic sizes
-    n_wp = q_waypoints.shape[0]
-    n_joints = q_waypoints.shape[1]
-    vmax = max_vel
-    amax = max_acc
-
-    # Per-joint forward/backward v^2 propagation (motion-cone inspired)
-    v_wp = np.full((n_wp, n_joints), vmax)
-    # endpoints stop
-    v_wp[0, :] = 0.0
-    v_wp[-1, :] = 0.0
-
-    # set zero velocity where there is no motion
-    for k in range(n_wp - 1):
-        zero_mask = np.isclose(q_waypoints[k + 1] - q_waypoints[k], 0.0)
-        v_wp[k, zero_mask] = 0.0
-
-    # Forward pass
-    for k in range(n_wp - 1):
-        D = np.abs(q_waypoints[k + 1] - q_waypoints[k])
-        for j in range(n_joints):
-            v_allow = np.sqrt(max(0.0, v_wp[k, j] ** 2 + 2.0 * amax * D[j]))
-            if v_wp[k + 1, j] > v_allow:
-                v_wp[k + 1, j] = v_allow
-
-    # Backward pass
-    for k in range(n_wp - 2, -1, -1):
-        D = np.abs(q_waypoints[k + 1] - q_waypoints[k])
-        for j in range(n_joints):
-            v_allow = np.sqrt(max(0.0, v_wp[k + 1, j] ** 2 + 2.0 * amax * D[j]))
-            if v_wp[k, j] > v_allow:
-                v_wp[k, j] = v_allow
-
-    # Compute per-segment times by taking the worst-case joint time
+    # initial per-segment time allocation from max joint displacement
     segment_times = []
-    for k in range(n_wp - 1):
-        D = q_waypoints[k + 1] - q_waypoints[k]
-        dt_seg = 0.0
-        for j in range(n_joints):
-            Dj = abs(D[j])
-            v0 = v_wp[k, j]
-            v1 = v_wp[k + 1, j]
+    for i in range(len(waypoints) - 1):
+        dq = q_waypoints[i + 1] - q_waypoints[i]
+        max_d = np.max(np.abs(dq))
+        dt = max_d / max_vel if (max_d > 0 and max_vel > 0) else 0.1
+        segment_times.append(dt)
 
-            if Dj < 1e-8 and v0 == 0 and v1 == 0:
-                dt_j = 0.0
-            else:
-                denom = (abs(v0) + abs(v1))
-                if denom > 1e-8:
-                    dt_j = 2.0 * Dj / denom
-                else:
-                    dt_j = 2.0 * np.sqrt(Dj / max(1e-8, amax))
-
-            if dt_j > dt_seg:
-                dt_seg = dt_j
-
-        if dt_seg < 1e-3:
-            dt_seg = 0.05
-        segment_times.append(dt_seg)
-
-    # Build time stamps
     time_stamps = [0.0]
     for dt_seg in segment_times:
         time_stamps.append(time_stamps[-1] + dt_seg)
-    total_time = time_stamps[-1]
+    total_time = max(time_stamps[-1], 1e-6)
 
-    # Build clamped cubic splines (zero endpoint velocities)
-    joint_splines = {}
-    for j, joint_name in enumerate(joint_names):
-        joint_values = q_waypoints[:, j]
-        spline = CubicSpline(time_stamps, joint_values, bc_type=((1, 0.0), (1, 0.0)))
-        joint_splines[joint_name] = spline
+    # build cubic splines per joint
+    joint_splines = {jn: CubicSpline(time_stamps, q_waypoints[:, j], bc_type=((1, 0.0), (1, 0.0)))
+                     for j, jn in enumerate(joint_names)}
 
-    # Validate and apply single global scaling if needed
-    if total_time <= 0.0:
-        return [(0.0, {jn: float(joint_splines[jn](0.0)) for jn in joint_names})]
+    # Find minimal global time scaling k >= 1 by bisection so that
+    # velocities (scale 1/k) and accelerations (scale 1/k^2) are within limits.
+    def feasible_with_scale(k: float) -> bool:
+        T = total_time * k
+        n_samples = int(max(200, min(3000, max(1, int(T * 50)))))
+        test_times = np.linspace(0.0, T, n_samples)
 
-    test_times = np.linspace(0.0, total_time, max(100, int(total_time * 50)))
-    max_vel_violation = 0.0
-    max_acc_violation = 0.0
-    for t in test_times[1:-1]:
-        for joint_name in joint_names:
-            spline = joint_splines[joint_name]
-            v = abs(spline(t, 1))
-            a = abs(spline(t, 2))
-            if v > max_vel:
-                max_vel_violation = max(max_vel_violation, v / max_vel)
-            if a > max_acc:
-                max_acc_violation = max(max_acc_violation, a / max_acc)
+        # when scaling time by k, new spline derivatives scale: v' = v / k, a' = a / k^2
+        for t in test_times:
+            # map t back to original spline parameter: t_orig = t / k
+            to = t / k
+            for jn in joint_names:
+                s = joint_splines[jn]
+                v = abs(s(to, 1)) / k
+                a = abs(s(to, 2)) / (k * k)
+                if max_vel > 0 and v > max_vel + 1e-12:
+                    return False
+                if max_acc > 0 and a > max_acc + 1e-12:
+                    return False
+        return True
 
-    max_violation = max(max_vel_violation, max_acc_violation)
-    if max_violation > 1.0:
-        scale_factor = max_violation * 1.15
-        time_stamps = [t * scale_factor for t in time_stamps]
-        total_time *= scale_factor
-        for j, joint_name in enumerate(joint_names):
-            joint_values = q_waypoints[:, j]
-            joint_splines[joint_name] = CubicSpline(time_stamps, joint_values, bc_type=((1, 0.0), (1, 0.0)))
+    # quick check: if already feasible with k=1, keep it
+    if feasible_with_scale(1.0):
+        chosen_k = 1.0
+    else:
+        # find upper bound by doubling until feasible (cap to avoid runaway)
+        k_low = 1.0
+        k_high = 2.0
+        max_k_cap = 1e3
+        while k_high < max_k_cap and not feasible_with_scale(k_high):
+            k_high *= 2.0
 
-    # Sample at fixed dt
+        if k_high >= max_k_cap:
+            # fallback: use conservative scaling to guarantee safety
+            chosen_k = k_high
+        else:
+            # bisection to find minimal feasible k
+            for _ in range(40):
+                k_mid = 0.5 * (k_low + k_high)
+                if feasible_with_scale(k_mid):
+                    k_high = k_mid
+                else:
+                    k_low = k_mid
+            chosen_k = k_high
+
+    # apply chosen scaling to timestamps and rebuild splines
+    time_stamps = [t * chosen_k for t in time_stamps]
+    total_time *= chosen_k
+    joint_splines = {jn: CubicSpline(time_stamps, q_waypoints[:, j], bc_type=((1, 0.0), (1, 0.0)))
+                     for j, jn in enumerate(joint_names)}
+
+    # Per-segment compression removed: keep global time-scaling result (chosen_k) to ensure prompt runtime.
+
+    # sample at fixed dt
     dt = 0.05
     trajectory_times = np.arange(0.0, total_time + dt, dt)
     trajectory_points = []
